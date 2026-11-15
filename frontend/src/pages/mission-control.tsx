@@ -12,12 +12,14 @@ interface Mission {
   id: number;
   code?: string;
   name: string;
+  status?: string;
   category?: string;
   destination?: string;
   phase?: string;
   planned_duration_days?: number;
   elapsed_duration_days?: number;
   crew_size?: number;
+  environment?: { launch_date?: string; data_class?: string };
   radiation_environment?: string;
   crew?: { astronaut_id: number; user_id: number; name: string; callsign: string; seat: string; role_on_mission: string }[];
 }
@@ -25,12 +27,14 @@ interface Mission {
 interface Astronaut {
   id: number;
   callsign?: string;
+  name?: string;
   full_name?: string;
   missions?: { id: number; name: string; phase: string; code: string }[];
 }
 
 interface HealthData {
   latest?: any;
+  observations?: any[];
   insights?: any[];
   risks?: any[];
   recommendations?: any[];
@@ -43,11 +47,13 @@ interface Incident {
   id: number;
   mission_id: number;
   astronaut_id?: number | null;
+  source?: string;
   severity: string;
   title: string;
   description: string;
   status: string;
   assigned_to?: number | null;
+  assigned_to_name?: string | null;
   created_at: string;
   acknowledged_at?: string | null;
   resolved_at?: string | null;
@@ -60,15 +66,31 @@ interface Incident {
 const fmt = (v: unknown, d = 1) => (typeof v === 'number' ? v.toFixed(d) : String(v ?? '—'));
 const fmtTime = (iso?: string | null) => {
   if (!iso) return '—';
-  try { return new Date(iso).toLocaleString(); } catch { return iso; }
+  try {
+    const timestamp = /(?:Z|[+-]\d{2}:\d{2})$/i.test(iso) ? iso : `${iso}Z`;
+    return new Date(timestamp).toLocaleString();
+  } catch {
+    return iso;
+  }
 };
 
-const healthStatusOf = (health?: HealthData, radiation?: any): 'critical' | 'attention' | 'normal' => {
+const OPEN_STATUSES = ['new', 'acknowledged', 'under_review', 'action_required'];
+
+const incidentCategory = (incident: Incident): string => {
+  const text = `${incident.title} ${incident.description}`.toLowerCase();
+  if (/radiation|dose|solar particle/.test(text)) return 'Radiation exposure';
+  if (/sleep|fatigue|recovery/.test(text)) return 'Sleep and recovery';
+  if (/stress|wellness|mood/.test(text)) return 'Wellness monitoring';
+  return 'Health monitoring';
+};
+
+const healthStatusOf = (health?: HealthData, radiation?: any): 'critical' | 'attention' | 'normal' | 'unknown' => {
+  if (!health?.latest) return 'unknown';
   const insights = health?.insights || [];
-  if (insights.some((i: any) => i.severity === 'critical' || i.severity === 'high')) return 'critical';
-  if (radiation?.alerts?.some((a: any) => a.severity === 'critical' || a.severity === 'high')) return 'critical';
-  if (insights.some((i: any) => i.severity === 'moderate' || i.severity === 'warning')) return 'attention';
-  if (radiation?.alerts?.some((a: any) => a.severity === 'moderate')) return 'attention';
+  if (insights.some((i: any) => i.severity === 'critical')) return 'critical';
+  if (radiation?.alerts?.some((a: any) => a.severity === 'critical')) return 'critical';
+  if (insights.some((i: any) => ['high', 'moderate', 'warning'].includes(i.severity))) return 'attention';
+  if (radiation?.alerts?.some((a: any) => ['high', 'moderate'].includes(a.severity))) return 'attention';
   return 'normal';
 };
 
@@ -82,12 +104,16 @@ export const MissionControlDashboard = () => {
   const [radiationMap, setRadiationMap] = useState<Record<number, any>>({});
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastSync, setLastSync] = useState<string | null>(null);
+  const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [actionLoadingId, setActionLoadingId] = useState<number | null>(null);
 
   const [activeTab, setActiveTab] = useState<'overview' | 'crew' | 'alerts' | 'incidents' | 'missions' | 'analytics'>('overview');
   const [selectedAstronautId, setSelectedAstronautId] = useState<number | null>(null);
   const [selectedMissionId, setSelectedMissionId] = useState<number | null>(null);
+  const [selectedIncidentId, setSelectedIncidentId] = useState<number | null>(null);
 
   // filters
   const [missionFilter, setMissionFilter] = useState<string>('all');
@@ -113,8 +139,9 @@ export const MissionControlDashboard = () => {
     navigate('/', { replace: true });
   };
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (background = false) => {
+    if (background) setRefreshing(true);
+    else setLoading(true);
     setError(null);
     try {
       const [mRes, aRes, iRes] = await Promise.all([
@@ -124,11 +151,12 @@ export const MissionControlDashboard = () => {
       ]);
       if (!mRes.success) throw new Error(mRes.error || 'Failed to load missions');
       if (!aRes.success) throw new Error(aRes.error || 'Failed to load astronauts');
+      if (!iRes.success) throw new Error(iRes.error || 'Failed to load incidents');
       const ms = mRes.data?.missions || [];
       const as = aRes.data?.astronauts || [];
       setMissions(ms);
       setAstronauts(as);
-      if (iRes.success) setIncidents(iRes.data?.incidents || []);
+      setIncidents(iRes.data?.incidents || []);
 
       // fetch health + radiation per astronaut
       const hMap: Record<number, HealthData> = {};
@@ -139,8 +167,10 @@ export const MissionControlDashboard = () => {
             api.get<HealthData>(`/astronauts/${a.id}/health`),
             api.get<any>(`/radiation?astronaut_id=${a.id}`),
           ]);
-          if (h.success && h.data) hMap[a.id] = h.data;
-          if (r.success && r.data) rMap[a.id] = r.data;
+          if (!h.success || !h.data) throw new Error(h.error || `Failed to load health data for ${a.callsign || a.id}`);
+          if (!r.success || !r.data) throw new Error(r.error || `Failed to load radiation data for ${a.callsign || a.id}`);
+          hMap[a.id] = h.data;
+          rMap[a.id] = r.data;
         }),
       );
       setHealthMap(hMap);
@@ -149,7 +179,8 @@ export const MissionControlDashboard = () => {
     } catch (e: any) {
       setError(e?.message || 'Failed to load Mission Control data');
     } finally {
-      setLoading(false);
+      if (background) setRefreshing(false);
+      else setLoading(false);
     }
   }, []);
 
@@ -208,31 +239,44 @@ export const MissionControlDashboard = () => {
   };
 
   const updateIncidentStatus = async (inc: Incident, status: string) => {
+    setActionLoadingId(inc.id);
+    setActionMessage(null);
     try {
-      await api.patch(`/incidents/${inc.id}`, { status, note: `Status set to ${status}` });
-      const iRes = await api.get<{ incidents: Incident[] }>('/incidents');
-      if (iRes.success) setIncidents(iRes.data?.incidents || []);
-    } catch {
-      // ignore
+      const response = await api.patch(`/incidents/${inc.id}`, { status, note: `Status set to ${status}` });
+      if (!response.success) throw new Error(response.error || `Unable to set incident to ${status}`);
+      setActionMessage(`Incident #${inc.id} updated: ${status.replace('_', ' ')}.`);
+      await load(true);
+    } catch (e: any) {
+      setActionMessage(e?.message || `Unable to set incident to ${status}`);
+    } finally {
+      setActionLoadingId(null);
     }
   };
 
   const acknowledgeIncident = async (inc: Incident) => {
+    setActionLoadingId(inc.id);
+    setActionMessage(null);
     try {
-      await api.post(`/incidents/${inc.id}/acknowledge`, {});
-      const iRes = await api.get<{ incidents: Incident[] }>('/incidents');
-      if (iRes.success) setIncidents(iRes.data?.incidents || []);
-    } catch {
-      // ignore
+      const response = await api.post(`/incidents/${inc.id}/acknowledge`, {});
+      if (!response.success) throw new Error(response.error || 'Unable to acknowledge incident');
+      setActionMessage(`Incident #${inc.id} acknowledged.`);
+      await load(true);
+    } catch (e: any) {
+      setActionMessage(e?.message || 'Unable to acknowledge incident');
+    } finally {
+      setActionLoadingId(null);
     }
   };
 
   // derived
-  const statusOf = (a: Astronaut) => healthStatusOf(healthMap[a.id], radiationMap[a.id]);
+  const statusOf = useCallback(
+    (a: Astronaut) => healthStatusOf(healthMap[a.id], radiationMap[a.id]),
+    [healthMap, radiationMap],
+  );
 
   const filteredAstronauts = useMemo(() => {
     return astronauts.filter((a) => {
-      const name = (a.full_name || '').toLowerCase();
+      const name = (a.name || a.full_name || '').toLowerCase();
       const cs = (a.callsign || '').toLowerCase();
       if (search && !name.includes(search.toLowerCase()) && !cs.includes(search.toLowerCase())) return false;
       if (missionFilter !== 'all') {
@@ -249,35 +293,133 @@ export const MissionControlDashboard = () => {
       }
       return true;
     });
-  }, [astronauts, search, missionFilter, statusFilter, phaseFilter, healthMap, radiationMap]);
+  }, [astronauts, search, missionFilter, statusFilter, phaseFilter, statusOf]);
 
   const overview = useMemo(() => {
-    const totalMissions = missions.length;
-    const totalAstro = astronauts.length;
-    let normal = 0, attention = 0, critical = 0;
+    const activeMissions = missions.filter((m) => m.status === 'active' && m.phase === 'in_flight').length;
+    const upcomingMissions = missions.filter((m) => m.status === 'upcoming').length;
+    const monitoredAstronauts = astronauts.filter((a) => Boolean(healthMap[a.id]?.latest)).length;
+    let normal = 0, attention = 0, critical = 0, unknown = 0;
     astronauts.forEach((a) => {
       const s = statusOf(a);
       if (s === 'normal') normal++;
       else if (s === 'attention') attention++;
-      else critical++;
+      else if (s === 'critical') critical++;
+      else unknown++;
     });
-    const activeIncidents = incidents.filter((i) => ['new', 'acknowledged', 'under_review', 'action_required'].includes(i.status)).length;
-    const criticalAlerts = incidents.filter((i) => i.severity === 'critical' && ['new', 'acknowledged', 'under_review', 'action_required'].includes(i.status)).length;
-    // recent health events from insights across astronauts
-    const recentEvents: any[] = [];
+    const openIncidents = incidents.filter((i) => OPEN_STATUSES.includes(i.status));
+    const activeIncidents = openIncidents.length;
+    const criticalAlerts = openIncidents.filter((i) => ['critical', 'high'].includes(i.severity)).length;
+    const recentEvents: {
+      id: string;
+      at?: string;
+      astronaut?: Astronaut;
+      type: string;
+      severity: string;
+      description: string;
+      dataClass: string;
+      missionName?: string;
+    }[] = [];
+    const addEvent = (event: (typeof recentEvents)[number]) => recentEvents.push(event);
     astronauts.forEach((a) => {
       const h = healthMap[a.id];
-      (h?.insights || []).slice(0, 3).forEach((ins: any) => {
-        recentEvents.push({ astronaut: a, insight: ins });
+      const latest = h?.latest;
+      if (latest?.recorded_at) {
+        addEvent({
+          id: `telemetry-${a.id}-${latest.id ?? latest.recorded_at}`,
+          at: latest.recorded_at,
+          astronaut: a,
+          type: 'Routine health check',
+          severity: statusOf(a),
+          description: `Simulated check recorded HR ${fmt(latest.heart_rate)} bpm, SpO₂ ${fmt(latest.spo2)}%, and sleep ${fmt(latest.sleep_hours)} h.`,
+          dataClass: 'SYNTHETIC DEMONSTRATION DATA',
+          missionName: h?.mission?.name,
+        });
+      }
+      (h?.assessments || []).slice(0, 2).forEach((assessment: any) => {
+        addEvent({
+          id: `assessment-${assessment.id}`,
+          at: assessment.created_at,
+          astronaut: a,
+          type: `${assessment.kind || 'crew'} assessment updated`,
+          severity: 'info',
+          description: 'An authorized assessment record was updated. Private notes and mood details are not shown here.',
+          dataClass: 'authorized summary',
+          missionName: h?.mission?.name,
+        });
+      });
+      (h?.insights || []).slice(0, 2).forEach((insight: any) => {
+        addEvent({
+          id: `insight-${insight.id}`,
+          at: insight.created_at,
+          astronaut: a,
+          type: insight.severity === 'info' || insight.severity === 'low' ? 'Monitoring update' : 'Health alert generated',
+          severity: insight.severity,
+          description: insight.summary,
+          dataClass: insight.data_class || 'derived',
+          missionName: h?.mission?.name,
+        });
+      });
+      (radiationMap[a.id]?.events || []).slice(-2).forEach((event: any) => {
+        addEvent({
+          id: `radiation-${a.id}-${event.id}`,
+          at: event.recorded_at,
+          astronaut: a,
+          type: 'Radiation monitoring update',
+          severity: 'warning',
+          description: `${event.event_label || 'Modelled radiation record'} · ${fmt(event.dose_increment_msv)} mSv increment (modelled).`,
+          dataClass: 'modelled scenario',
+          missionName: radiationMap[a.id]?.mission?.name,
+        });
       });
     });
-    recentEvents.sort((a, b) => (b.insight.created_at || '').localeCompare(a.insight.created_at || ''));
-    return { totalMissions, totalAstro, normal, attention, critical, activeIncidents, criticalAlerts, recentEvents: recentEvents.slice(0, 10) };
-  }, [missions, astronauts, healthMap, radiationMap, incidents]);
+    incidents.forEach((incident) => {
+      addEvent({
+        id: `incident-${incident.id}`,
+        at: incident.created_at,
+        astronaut: astronauts.find((a) => a.id === incident.astronaut_id),
+        type: 'Medical alert generated',
+        severity: incident.severity,
+        description: incident.description,
+        dataClass: incident.source === 'synthetic_demo' ? 'SYNTHETIC DEMONSTRATION DATA' : incident.source || 'incident',
+        missionName: missions.find((m) => m.id === incident.mission_id)?.name,
+      });
+      (incident.events || []).forEach((event) => {
+        addEvent({
+          id: `incident-event-${event.id}`,
+          at: event.created_at,
+          astronaut: astronauts.find((a) => a.id === incident.astronaut_id),
+          type: event.action === 'acknowledged' ? 'Medical officer acknowledged alert' : `Incident ${event.action}`,
+          severity: incident.severity,
+          description: event.note || incident.title,
+          dataClass: incident.source === 'synthetic_demo' ? 'SYNTHETIC DEMONSTRATION DATA' : incident.source || 'incident',
+          missionName: missions.find((m) => m.id === incident.mission_id)?.name,
+        });
+      });
+    });
+    recentEvents.sort((a, b) => (b.at || '').localeCompare(a.at || ''));
+    return {
+      activeMissions,
+      upcomingMissions,
+      monitoredAstronauts,
+      normal,
+      attention,
+      critical,
+      unknown,
+      activeIncidents,
+      criticalAlerts,
+      recentEvents: recentEvents.slice(0, 12),
+    };
+  }, [missions, astronauts, healthMap, radiationMap, incidents, statusOf]);
 
   const selectedAstronaut = astronauts.find((a) => a.id === selectedAstronautId) || null;
   const selectedHealth = selectedAstronautId ? healthMap[selectedAstronautId] : null;
   const selectedRadiation = selectedAstronautId ? radiationMap[selectedAstronautId] : null;
+  const selectedMission = missions.find((m) => m.id === selectedHealth?.mission?.id) || null;
+  const selectedAssignment = selectedMission?.crew?.find((c) => c.astronaut_id === selectedAstronautId);
+  const stressIndicator = selectedHealth?.observations?.find(
+    (observation: any) => observation.metric === 'simulated_stress_indicator',
+  );
 
   const selectedAstronautIncidents = incidents.filter((i) => i.astronaut_id === selectedAstronautId);
 
@@ -307,7 +449,7 @@ export const MissionControlDashboard = () => {
         <div className="max-w-md text-center">
           <h1 className="text-2xl font-serif text-warm-ivory mb-2">Unable to load Mission Control</h1>
           <p className="text-muted-silver text-sm mb-4">{error}</p>
-          <Button onClick={load}>Retry</Button>
+          <Button onClick={() => load()}>Retry</Button>
         </div>
       </section>
     );
@@ -334,10 +476,29 @@ export const MissionControlDashboard = () => {
             </p>
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={load}>Refresh</Button>
+            <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing}>
+              {refreshing ? 'Refreshing…' : 'Refresh'}
+            </Button>
             <Button variant="ghost" size="sm" onClick={handleLogoutClick}>Sign Out</Button>
           </div>
         </div>
+
+        <div className="mb-5 rounded-lg border border-warning/30 bg-warning/5 px-4 py-3">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-soft-amber">
+            SYNTHETIC DEMONSTRATION DATA
+          </p>
+          <p className="mt-1 text-xs text-muted-silver">
+            Fictional crew and simulated telemetry only. Radiation values are modelled scenario estimates, not dosimeter readings; no clinical diagnoses or NASA measurements are represented.
+          </p>
+        </div>
+
+        {actionMessage && (
+          <div className="mb-4">
+            <Alert variant={actionMessage.includes('Unable') ? 'destructive' : 'success'}>
+              {actionMessage}
+            </Alert>
+          </div>
+        )}
 
         {/* Tabs */}
         <div className="flex flex-wrap gap-2 mb-6 border-b border-border/20 pb-2">
@@ -360,11 +521,15 @@ export const MissionControlDashboard = () => {
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div className="rounded-xl p-4 bg-surface/50 border border-border/20">
                 <p className="text-xs text-muted-silver uppercase tracking-wider">Active missions</p>
-                <p className="text-3xl font-bold text-warm-ivory">{overview.totalMissions}</p>
+                <p className="text-3xl font-bold text-warm-ivory">{overview.activeMissions}</p>
               </div>
               <div className="rounded-xl p-4 bg-surface/50 border border-border/20">
                 <p className="text-xs text-muted-silver uppercase tracking-wider">Astronauts monitored</p>
-                <p className="text-3xl font-bold text-warm-ivory">{overview.totalAstro}</p>
+                <p className="text-3xl font-bold text-warm-ivory">{overview.monitoredAstronauts}</p>
+              </div>
+              <div className="rounded-xl p-4 bg-surface/50 border border-border/20">
+                <p className="text-xs text-muted-silver uppercase tracking-wider">Upcoming missions</p>
+                <p className="text-3xl font-bold text-warm-ivory">{overview.upcomingMissions}</p>
               </div>
               <div className="rounded-xl p-4 bg-surface/50 border border-border/20">
                 <p className="text-xs text-muted-silver uppercase tracking-wider">Normal</p>
@@ -383,9 +548,15 @@ export const MissionControlDashboard = () => {
                 <p className="text-3xl font-bold text-warm-ivory">{overview.activeIncidents}</p>
               </div>
               <div className="rounded-xl p-4 bg-surface/50 border border-border/20">
-                <p className="text-xs text-muted-silver uppercase tracking-wider">Critical alerts</p>
+                <p className="text-xs text-muted-silver uppercase tracking-wider">High / critical alerts</p>
                 <p className="text-3xl font-bold text-restrained-red">{overview.criticalAlerts}</p>
               </div>
+              {overview.unknown > 0 && (
+                <div className="rounded-xl p-4 bg-surface/50 border border-border/20">
+                  <p className="text-xs text-muted-silver uppercase tracking-wider">Awaiting telemetry</p>
+                  <p className="text-3xl font-bold text-muted-silver">{overview.unknown}</p>
+                </div>
+              )}
             </div>
 
             <div className="rounded-xl p-6 bg-surface/50 border border-border/20">
@@ -394,14 +565,29 @@ export const MissionControlDashboard = () => {
                 <p className="text-muted-silver text-sm">No recent events.</p>
               ) : (
                 <ul className="space-y-2 text-sm">
-                  {overview.recentEvents.map((ev: any, i: number) => (
-                    <li key={i} className="border-b border-border/10 pb-2">
-                      <div className="flex justify-between">
-                        <span className="text-warm-ivory font-medium">{ev.astronaut.callsign} — {ev.insight.title}</span>
-                        <span className="text-xs text-muted-silver/60">{fmtTime(ev.insight.created_at)}</span>
+                  {overview.recentEvents.map((ev) => (
+                    <li key={ev.id} className="border-b border-border/10 pb-2">
+                      <div className="flex flex-wrap justify-between gap-2">
+                        <span className="text-warm-ivory font-medium">
+                          {ev.astronaut?.callsign || 'Mission'} — {ev.type}
+                        </span>
+                        <span className="text-xs text-muted-silver/60">{fmtTime(ev.at)}</span>
                       </div>
-                      <p className="text-xs text-muted-silver mt-1">{ev.insight.summary}</p>
-                      <p className="text-xs text-muted-silver/50">{ev.insight.severity} · {ev.insight.data_class}</p>
+                      <p className="text-xs text-muted-silver mt-1">{ev.description}</p>
+                      <p className="text-xs text-muted-silver/50">
+                        {ev.severity} · {ev.dataClass}{ev.missionName ? ` · ${ev.missionName}` : ''}
+                      </p>
+                      {ev.astronaut && (
+                        <button
+                          className="mt-1 text-xs text-celestial-blue hover:underline"
+                          onClick={() => {
+                            setSelectedAstronautId(ev.astronaut!.id);
+                            setActiveTab('crew');
+                          }}
+                        >
+                          Open crew record
+                        </button>
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -433,6 +619,7 @@ export const MissionControlDashboard = () => {
                   <option value="normal">Normal</option>
                   <option value="attention">Attention</option>
                   <option value="critical">Critical</option>
+                  <option value="unknown">Awaiting telemetry</option>
                 </select>
               </div>
               <div>
@@ -470,10 +657,11 @@ export const MissionControlDashboard = () => {
                               <span className="text-warm-ivory font-medium">{a.callsign}</span>
                               <span className={`text-xs px-2 py-0.5 rounded ${
                                 st === 'critical' ? 'bg-restrained-red/20 text-restrained-red' :
-                                st === 'attention' ? 'bg-warning/20 text-warning' : 'bg-success/20 text-success'
+                                st === 'attention' ? 'bg-warning/20 text-warning' :
+                                st === 'unknown' ? 'bg-border/20 text-muted-silver' : 'bg-success/20 text-success'
                               }`}>{st}</span>
                             </div>
-                            <p className="text-xs text-muted-silver">{a.full_name}</p>
+                            <p className="text-xs text-muted-silver">{a.name || a.full_name}</p>
                             {latest && (
                               <p className="text-xs text-muted-silver/60 mt-1">
                                 HR {fmt(latest.heart_rate)} · SpO₂ {fmt(latest.spo2)} · Sleep {fmt(latest.sleep_hours)}
@@ -496,15 +684,17 @@ export const MissionControlDashboard = () => {
                     <div className="flex justify-between items-start">
                       <div>
                         <h2 className="text-xl font-serif font-bold text-warm-ivory">
-                          {selectedAstronaut.full_name} ({selectedAstronaut.callsign})
+                          {selectedAstronaut.name || selectedAstronaut.full_name} ({selectedAstronaut.callsign})
                         </h2>
+                        <p className="text-xs text-muted-silver/70">Astronaut ID #{selectedAstronaut.id}</p>
                         <p className="text-sm text-muted-silver">
-                          Missions: {(selectedAstronaut.missions || []).map((m) => `${m.name} (${m.phase})`).join(', ') || '—'}
+                          Mission: {selectedMission?.name || '—'} · Role: {selectedAssignment?.role_on_mission || 'Crew'}
                         </p>
                       </div>
                       <span className={`text-xs px-2 py-1 rounded ${
                         statusOf(selectedAstronaut) === 'critical' ? 'bg-restrained-red/20 text-restrained-red' :
-                        statusOf(selectedAstronaut) === 'attention' ? 'bg-warning/20 text-warning' : 'bg-success/20 text-success'
+                        statusOf(selectedAstronaut) === 'attention' ? 'bg-warning/20 text-warning' :
+                        statusOf(selectedAstronaut) === 'unknown' ? 'bg-border/20 text-muted-silver' : 'bg-success/20 text-success'
                       }`}>{statusOf(selectedAstronaut)}</span>
                     </div>
 
@@ -519,6 +709,12 @@ export const MissionControlDashboard = () => {
                         <div><p className="text-xs text-muted-silver">Steps</p><p className="text-warm-ivory font-mono">{fmt(selectedHealth.latest.steps,0)}</p></div>
                         <div><p className="text-xs text-muted-silver">Last update</p><p className="text-warm-ivory text-xs">{fmtTime(selectedHealth.latest.recorded_at)}</p></div>
                       </div>
+                    )}
+
+                    {stressIndicator && (
+                      <p className="text-xs text-soft-amber">
+                        Simulated mission-load wellness indicator: {fmt(stressIndicator.value)} / 10 · not a private self-report or clinical assessment.
+                      </p>
                     )}
 
                     {selectedRadiation && (
@@ -596,59 +792,116 @@ export const MissionControlDashboard = () => {
         {/* ALERTS */}
         {activeTab === 'alerts' && (
           <div className="space-y-4">
-            <h2 className="text-xl font-serif font-bold text-warm-ivory">Centralized Alerts</h2>
-            {(() => {
-              const alerts: any[] = [];
-              astronauts.forEach((a) => {
-                const h = healthMap[a.id];
-                (h?.insights || []).forEach((ins: any) => {
-                  if (ins.severity === 'critical' || ins.severity === 'high' || ins.severity === 'moderate') {
-                    alerts.push({ astronaut: a, insight: ins });
-                  }
-                });
-                const r = radiationMap[a.id];
-                (r?.alerts || []).forEach((al: any) => {
-                  alerts.push({ astronaut: a, radiationAlert: al });
-                });
-              });
-              // incidents
-              incidents.forEach((inc) => {
-                if (['new', 'acknowledged', 'under_review', 'action_required'].includes(inc.status)) {
-                  const a = astronauts.find((x) => x.id === inc.astronaut_id);
-                  alerts.push({ incident: inc, astronaut: a });
-                }
-              });
-              if (alerts.length === 0) return <p className="text-muted-silver text-sm">No active alerts.</p>;
-              return (
-                <ul className="space-y-3">
-                  {alerts.map((al, i) => {
-                    const sev = al.incident?.severity || al.radiationAlert?.severity || al.insight?.severity;
-                    const color = sev === 'critical' ? 'border-restrained-red/40' : sev === 'high' ? 'border-warning/40' : 'border-border/20';
-                    return (
-                      <li key={i} className={`rounded-xl p-4 bg-surface/50 border ${color}`}>
-                        <div className="flex justify-between">
-                          <span className="text-warm-ivory font-medium">
-                            {al.incident ? `Incident: ${al.incident.title}` : al.radiationAlert ? al.radiationAlert.title : al.insight.title}
-                          </span>
-                          <span className="text-xs text-muted-silver/60">{fmtTime(al.incident?.created_at || al.radiationAlert?.at || al.insight?.created_at)}</span>
-                        </div>
-                        <p className="text-xs text-muted-silver mt-1">
-                          Astronaut: {al.astronaut?.callsign || '—'} · Severity: {sev}
-                        </p>
-                        <p className="text-xs text-muted-silver/70 mt-1">
-                          {al.incident ? al.incident.description : al.radiationAlert ? al.radiationAlert.detail : al.insight.summary}
-                        </p>
-                        {al.insight?.explanation && (
-                          <p className="text-xs text-muted-silver/50 mt-1">
-                            Why: {typeof al.insight.explanation === 'string' ? al.insight.explanation : JSON.stringify(al.insight.explanation)}
+            <div className="flex flex-wrap items-end justify-between gap-2">
+              <div>
+                <h2 className="text-xl font-serif font-bold text-warm-ivory">Operational Alerts</h2>
+                <p className="text-xs text-muted-silver mt-1">Persistent alert lifecycle backed by incident records.</p>
+              </div>
+              <Button size="sm" variant="outline" onClick={() => setActiveTab('incidents')}>Open incident desk</Button>
+            </div>
+            {incidents.length === 0 ? (
+              <p className="text-muted-silver text-sm">No alert records are available.</p>
+            ) : (
+              <ul className="space-y-3">
+                {incidents.map((incident) => {
+                  const astronaut = astronauts.find((a) => a.id === incident.astronaut_id);
+                  const mission = missions.find((m) => m.id === incident.mission_id);
+                  const color = incident.severity === 'critical'
+                    ? 'border-restrained-red/50'
+                    : incident.severity === 'high'
+                      ? 'border-warning/40'
+                      : 'border-border/20';
+                  return (
+                    <li key={incident.id} className={`rounded-xl p-4 bg-surface/50 border ${color}`}>
+                      <div className="flex flex-wrap justify-between gap-2">
+                        <div>
+                          <p className="text-warm-ivory font-medium">Alert #{incident.id} · {incident.title}</p>
+                          <p className="text-xs text-muted-silver mt-1">
+                            {incidentCategory(incident)} · {astronaut?.callsign || 'Mission-level'} · {mission?.name || `Mission ${incident.mission_id}`}
                           </p>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-xs uppercase tracking-wide text-soft-amber">{incident.severity} · {incident.status.replace('_', ' ')}</p>
+                          <p className="text-xs text-muted-silver/60">{fmtTime(incident.created_at)}</p>
+                        </div>
+                      </div>
+                      <p className="text-sm text-muted-silver mt-3">{incident.description}</p>
+                      <p className="text-xs text-muted-silver/70 mt-2">
+                        Assigned responder: {incident.assigned_to_name || (incident.assigned_to ? `Staff #${incident.assigned_to}` : 'Unassigned')}
+                      </p>
+                      {incident.source === 'synthetic_demo' && (
+                        <p className="mt-1 text-[10px] uppercase tracking-wider text-soft-amber">SYNTHETIC DEMONSTRATION DATA</p>
+                      )}
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {astronaut && (
+                          <Button size="sm" variant="outline" onClick={() => {
+                            setSelectedAstronautId(astronaut.id);
+                            setActiveTab('crew');
+                          }}>
+                            Open astronaut details
+                          </Button>
                         )}
-                      </li>
-                    );
-                  })}
-                </ul>
-              );
-            })()}
+                        {incident.status === 'new' && (
+                          <Button size="sm" variant="outline" disabled={actionLoadingId === incident.id} onClick={() => acknowledgeIncident(incident)}>
+                            {actionLoadingId === incident.id ? 'Updating…' : 'Acknowledge'}
+                          </Button>
+                        )}
+                        {incident.status !== 'resolved' && (
+                          <Button size="sm" variant="outline" disabled={actionLoadingId === incident.id} onClick={() => updateIncidentStatus(incident, 'resolved')}>
+                            Resolve
+                          </Button>
+                        )}
+                        <button
+                          className="text-xs text-celestial-blue hover:underline px-2"
+                          onClick={() => {
+                            setSelectedIncidentId(incident.id);
+                            setActiveTab('incidents');
+                          }}
+                        >
+                          View incident details
+                        </button>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            <div className="rounded-xl p-5 bg-surface/40 border border-border/10">
+              <h3 className="text-sm font-medium text-warm-ivory">Automated monitoring signals</h3>
+              <p className="text-xs text-muted-silver mt-1">
+                Derived health insights and modelled radiation notifications are informative signals; acknowledgment and resolution are recorded on their associated incident above.
+              </p>
+              <ul className="mt-3 space-y-2">
+                {astronauts.flatMap((astronaut) => {
+                  const insights = (healthMap[astronaut.id]?.insights || [])
+                    .filter((insight: any) => ['critical', 'high', 'moderate'].includes(insight.severity))
+                    .map((insight: any) => ({
+                      key: `insight-${insight.id}`,
+                      title: insight.title,
+                      detail: insight.summary,
+                      severity: insight.severity,
+                      at: insight.created_at,
+                      kind: 'Derived health insight',
+                    }));
+                  const radiationAlerts = (radiationMap[astronaut.id]?.alerts || []).map((alert: any, index: number) => ({
+                    key: `radiation-${astronaut.id}-${index}-${alert.at}`,
+                    title: alert.title,
+                    detail: alert.detail,
+                    severity: alert.severity,
+                    at: alert.at,
+                    kind: 'Modelled radiation signal',
+                  }));
+                  return [...insights, ...radiationAlerts].map((signal) => (
+                    <li key={signal.key} className="flex flex-wrap justify-between gap-2 border-t border-border/10 pt-2 text-xs">
+                      <span className="text-warm-ivory">{astronaut.callsign} · {signal.kind}: {signal.title}</span>
+                      <span className="text-muted-silver">{signal.severity} · {fmtTime(signal.at)}</span>
+                      <p className="w-full text-muted-silver/70">{signal.detail}</p>
+                    </li>
+                  ));
+                })}
+              </ul>
+            </div>
           </div>
         )}
 
@@ -710,24 +963,29 @@ export const MissionControlDashboard = () => {
                           <p className="text-warm-ivory font-medium">#{inc.id} {inc.title}</p>
                           <p className="text-xs text-muted-silver">{inc.severity} · {inc.status} · {fmtTime(inc.created_at)}</p>
                           <p className="text-xs text-muted-silver/70 mt-1">{inc.description}</p>
+                          {inc.assigned_to_name && <p className="text-xs text-muted-silver/60 mt-1">Responder: {inc.assigned_to_name}</p>}
                           {inc.resolution_summary && <p className="text-xs text-success mt-1">Resolution: {inc.resolution_summary}</p>}
                         </div>
                         <div className="flex flex-wrap gap-2">
                           {inc.status === 'new' && (
-                            <Button size="sm" variant="outline" onClick={() => acknowledgeIncident(inc)}>Acknowledge</Button>
+                            <Button size="sm" variant="outline" disabled={actionLoadingId === inc.id} onClick={() => acknowledgeIncident(inc)}>Acknowledge</Button>
                           )}
                           {inc.status !== 'resolved' && inc.status !== 'under_review' && (
-                            <Button size="sm" variant="outline" onClick={() => updateIncidentStatus(inc, 'under_review')}>Under Review</Button>
+                            <Button size="sm" variant="outline" disabled={actionLoadingId === inc.id} onClick={() => updateIncidentStatus(inc, 'under_review')}>Under Review</Button>
                           )}
                           {inc.status !== 'resolved' && inc.status !== 'action_required' && (
-                            <Button size="sm" variant="outline" onClick={() => updateIncidentStatus(inc, 'action_required')}>Action Required</Button>
+                            <Button size="sm" variant="outline" disabled={actionLoadingId === inc.id} onClick={() => updateIncidentStatus(inc, 'action_required')}>Action Required</Button>
                           )}
                           {inc.status !== 'resolved' && (
-                            <Button size="sm" variant="outline" onClick={() => updateIncidentStatus(inc, 'resolved')}>Resolve</Button>
+                            <Button size="sm" variant="outline" disabled={actionLoadingId === inc.id} onClick={() => updateIncidentStatus(inc, 'resolved')}>Resolve</Button>
                           )}
                         </div>
                       </div>
-                      {inc.events && inc.events.length > 0 && (
+                      <details className="mt-2" open={selectedIncidentId === inc.id}>
+                        <summary className="cursor-pointer text-xs text-celestial-blue hover:underline">Incident details and audit history</summary>
+                        <p className="mt-2 text-xs text-muted-silver">Mission: {missions.find((mission) => mission.id === inc.mission_id)?.name || `#${inc.mission_id}`}</p>
+                        <p className="text-xs text-muted-silver">Astronaut: {astronauts.find((astronaut) => astronaut.id === inc.astronaut_id)?.callsign || 'Mission-level'}</p>
+                        {inc.events && inc.events.length > 0 && (
                         <div className="mt-2 border-t border-border/10 pt-2">
                           <p className="text-xs text-muted-silver/60 mb-1">History</p>
                           <ul className="space-y-1 text-xs text-muted-silver/70">
@@ -736,7 +994,8 @@ export const MissionControlDashboard = () => {
                             ))}
                           </ul>
                         </div>
-                      )}
+                        )}
+                      </details>
                     </li>
                   ))}
                 </ul>
@@ -760,9 +1019,12 @@ export const MissionControlDashboard = () => {
                       <div className="flex flex-wrap justify-between gap-2">
                         <div>
                           <p className="text-warm-ivory font-medium">{m.name} {m.code ? `(${m.code})` : ''}</p>
-                          <p className="text-xs text-muted-silver">{m.category} · {m.destination} · {m.phase?.replace('_',' ')}</p>
+                          <p className="text-xs text-muted-silver">{m.status || m.phase?.replace('_', ' ')} · {m.category} · {m.destination} · {m.phase?.replace('_',' ')}</p>
                           <p className="text-xs text-muted-silver/60 mt-1">
                             Duration: {m.elapsed_duration_days ?? '—'} / {m.planned_duration_days ?? '—'} days · Crew: {m.crew_size ?? m.crew?.length ?? '—'} · Open incidents: {openInc}
+                          </p>
+                          <p className="text-xs text-muted-silver/60">
+                            Launch date: {m.environment?.launch_date || 'Not recorded'} · Expected duration: {m.planned_duration_days ?? '—'} days · Elapsed: {m.elapsed_duration_days ?? '—'} days
                           </p>
                         </div>
                         <Button size="sm" variant="outline" onClick={() => { setSelectedMissionId(m.id); setActiveTab('analytics'); }}>Analytics</Button>

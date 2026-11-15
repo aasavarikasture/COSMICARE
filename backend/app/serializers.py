@@ -222,6 +222,8 @@ def incident_out(i: Incident, db: Session | None = None) -> dict:
             }
             for e in i.events
         ]
+        responder = db.get(User, i.assigned_to) if i.assigned_to else None
+        data["assigned_to_name"] = responder.full_name if responder else None
     return data
 
 

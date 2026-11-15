@@ -27,7 +27,7 @@ The primary issue was not a missing feature; it was a design-system mismatch. Th
 
 ## Backend changes
 
-No backend logic changes were required for this repair. The API and database architecture remained intact, consistent with the requirement to preserve the existing implementation.
+No backend logic changes were required for the original readability repair. The subsequent Mission Control demonstration work uses the existing API and database architecture without adding models or migrations.
 
 ## Frontend changes
 
@@ -39,7 +39,7 @@ No backend logic changes were required for this repair. The API and database arc
 
 ## Database changes
 
-None. The live database schema and seed data were left intact.
+No schema changes. The existing database and user-created records were preserved; Mission Control demo records are added idempotently and are not used to overwrite existing records.
 
 ## Research data corrections
 
@@ -58,7 +58,7 @@ None. The live database schema and seed data were left intact.
 ## Tests executed
 
 - python -m pytest -q backend/tests
-  - Result: PASS (29 tests passed)
+  - Result: PASS (30 tests passed)
 - cd frontend && npm test
   - Result: PASS (2 test files, 2 tests passed)
 - cd frontend && npm run lint
@@ -75,9 +75,19 @@ None. The live database schema and seed data were left intact.
 - Research API dataset registry: PASS
 - Frontend automated tests: PASS
 - Visual browser-level polish beyond headless validation: PARTIAL
-- Manual end-user dashboard QA in a live browser: NOT VERIFIED
+- Mission Control browser workflow (overview, refresh, crew details, alerts, missions): PASS
+- Research Explorer live visual QA: NOT VERIFIED
 
 ## Remaining limitations
 
 - This environment did not provide a browser UI automation pass for photo-accurate visual verification.
 - The existing application is still a demonstration system with simulated data and synthetic research examples in the sample registry; that distinction is now clearly communicated in the UI.
+
+## Mission Control demonstration scenario
+
+- Startup adds a tagged long-duration orbital mission and an upcoming mission, plus five fictional crew telemetry profiles, stress indicators, monitoring insights, and two synthetic incidents.
+- The seed uses stable identifiers and checks record provenance so repeated starts do not duplicate or overwrite the demonstration scenario.
+- Mission Control shows a persistent “SYNTHETIC DEMONSTRATION DATA” notice; scenario readings are explicitly simulated, radiation values are labelled modelled, and no clinical or NASA measurement claims are made.
+- Summary counts and recent events are derived from the mission, astronaut, health, radiation, and incident APIs. Alert acknowledgement and resolution use the existing incident endpoints.
+- Browser verification used Mission Control login against the local frontend and backend. Overview, refresh, crew details, alert category/responder display, and both mission cards were exercised. Incident acknowledgement/resolution and role restriction were verified with the backend integration test.
+- Current browser-console status was not fully audited; this report does not claim the entire application is free of console warnings.

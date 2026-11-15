@@ -26,7 +26,7 @@ from .routers import (
     radiation,
     research,
 )
-from .seed import seed_if_empty
+from .seed import ensure_mission_control_demo, seed_if_empty
 
 logger = logging.getLogger("cosmicare")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -43,6 +43,11 @@ async def lifespan(app: FastAPI):
     if settings.auto_seed:
         try:
             seed_if_empty()
+            db = SessionLocal()
+            try:
+                ensure_mission_control_demo(db)
+            finally:
+                db.close()
             logger.info("Demo data ready")
         except Exception:  # pragma: no cover - startup diagnostics
             logger.exception("Seeding failed")

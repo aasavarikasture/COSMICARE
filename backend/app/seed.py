@@ -13,8 +13,10 @@ from sqlalchemy.orm import Session
 from . import simulation
 from .database import Base, SessionLocal, engine
 from .models import (
+    AIInsight,
     Assessment,
     AstronautProfile,
+    HealthObservation,
     Incident,
     IncidentEvent,
     Intervention,
@@ -25,6 +27,7 @@ from .models import (
     Notification,
     PrivacyPreference,
     TelemetryScenario,
+    TelemetrySnapshot,
     User,
 )
 from .reference import MISSION_PRESETS
@@ -437,6 +440,405 @@ def reset_and_seed(db: Session) -> dict:
         return seed_demo(fresh)
     finally:
         fresh.close()
+
+
+def ensure_mission_control_demo(db: Session) -> dict:
+    """Add the Mission Control demonstration scenario without resetting existing data."""
+    now = datetime.now(timezone.utc)
+    demo_marker = "SYNTHETIC DEMONSTRATION DATA"
+    active_code = "COSMICARE-MC-DEMO-2026"
+    upcoming_code = "COSMICARE-MC-UPCOMING-2026"
+    active = db.scalar(select(Mission).where(Mission.code == active_code))
+    upcoming = db.scalar(select(Mission).where(Mission.code == upcoming_code))
+
+    # Never adopt or modify a mission that happens to use one of the reserved codes.
+    if active and demo_marker not in active.description:
+        return {"created": False, "reason": "reserved mission code already in use"}
+    if upcoming and demo_marker not in upcoming.description:
+        return {"created": False, "reason": "reserved mission code already in use"}
+    created = active is None or upcoming is None
+
+    crew_specs = [
+        {"callsign": "REYES", "heart_rate": 72.0, "spo2": 98.1, "body_temp": 36.7, "sleep_hours": 7.4, "stress": 2.8, "severity": "low"},
+        {"callsign": "LIMA", "heart_rate": 68.0, "spo2": 98.5, "body_temp": 36.6, "sleep_hours": 7.8, "stress": 2.2, "severity": "low"},
+        {"callsign": "PARK", "heart_rate": 91.0, "spo2": 96.7, "body_temp": 37.0, "sleep_hours": 5.8, "stress": 5.8, "severity": "moderate"},
+        {"callsign": "VOSS", "heart_rate": 96.0, "spo2": 96.2, "body_temp": 37.1, "sleep_hours": 5.4, "stress": 6.4, "severity": "moderate"},
+        {"callsign": "OKAFOR", "heart_rate": 112.0, "spo2": 94.3, "body_temp": 37.5, "sleep_hours": 4.7, "stress": 8.1, "severity": "critical"},
+    ]
+    crew_profiles: list[AstronautProfile] = []
+    for spec in crew_specs:
+        profile = db.scalar(
+            select(AstronautProfile)
+            .join(User, User.id == AstronautProfile.user_id)
+            .where(User.email == f"{spec['callsign'].lower()}@cosmicare.demo")
+        )
+        if profile:
+            crew_profiles.append(profile)
+
+    # A partially seeded development database may not yet have the full demo crew.
+    for name, callsign, age, sex, height, weight, flight_hours in ASTRONAUTS:
+        if len(crew_profiles) >= len(crew_specs):
+            break
+        if any(p.callsign == callsign for p in crew_profiles):
+            continue
+        email = f"mc-demo-{callsign.lower()}@cosmicare.demo"
+        user = db.scalar(select(User).where(User.email == email))
+        if user and user.role == "astronaut" and user.astronaut_profile:
+            profile = user.astronaut_profile
+        elif user:
+            continue
+        else:
+            user = _create_user(
+                db,
+                name=name,
+                email=email,
+                role="astronaut",
+                callsign=callsign,
+                age=age,
+                sex=sex,
+                height=height,
+                weight=weight,
+                flight_hours=flight_hours,
+            )
+            db.flush()
+            profile = user.astronaut_profile
+        crew_profiles.append(profile)
+    if len(crew_profiles) < len(crew_specs):
+        raise RuntimeError("Unable to provision five synthetic Mission Control crew profiles")
+
+    control = db.scalar(select(User).where(User.role == "mission_control").order_by(User.id))
+    if not control:
+        email = "mc-demo-control@cosmicare.demo"
+        if db.scalar(select(User.id).where(User.email == email)):
+            raise RuntimeError("Mission Control demo account email is already in use")
+        control = _create_user(
+            db, name="Mission Control Demonstrator", email=email, role="mission_control"
+        )
+    medical = db.scalar(select(User).where(User.role == "medical").order_by(User.id))
+
+    if not active:
+        active = Mission(
+            code=active_code,
+            name="Orbital Expedition — Crew Health Demonstration",
+            category="Long-duration orbital demonstration",
+            destination="Low Earth Orbit",
+            planned_duration_days=180,
+            elapsed_duration_days=64,
+            phase="in_flight",
+            status="active",
+            crew_size=len(crew_profiles),
+            gravity_g=0.0,
+            radiation_environment="LEO",
+            radiation_dose_rate_msv_day=0.45,
+            comm_delay_seconds=2,
+            exercise_available=True,
+            medical_support="onboard",
+            environment={
+                "launch_date": (now - timedelta(days=64)).date().isoformat(),
+                "data_class": "synthetic_demonstration",
+            },
+            monitoring_profile={"focus": ["cardiovascular", "sleep", "wellness"], "weights": {}},
+            description=f"{demo_marker}. Fictional crew and simulated telemetry for interface demonstration only.",
+        )
+        db.add(active)
+        db.flush()
+    if not upcoming:
+        upcoming = Mission(
+            code=upcoming_code,
+            name="Lunar Gateway — Upcoming Crew Readiness",
+            category="Upcoming lunar mission",
+            destination="Near-Rectilinear Halo Orbit",
+            planned_duration_days=120,
+            elapsed_duration_days=0,
+            phase="pre_mission",
+            status="upcoming",
+            crew_size=3,
+            gravity_g=0.16,
+            radiation_environment="deep_space",
+            radiation_dose_rate_msv_day=1.2,
+            comm_delay_seconds=2,
+            exercise_available=True,
+            medical_support="telemedicine_delayed",
+            environment={
+                "launch_date": (now + timedelta(days=45)).date().isoformat(),
+                "data_class": "synthetic_demonstration",
+            },
+            monitoring_profile={"focus": ["readiness", "sleep", "cardiovascular"], "weights": {}},
+            description=f"{demo_marker}. Planned mission dates and crew size are fictional demonstration values.",
+        )
+        db.add(upcoming)
+        db.flush()
+
+    for profile in crew_profiles:
+        if not db.scalar(
+            select(MissionAssignment.id).where(
+                MissionAssignment.mission_id == active.id,
+                MissionAssignment.user_id == profile.user_id,
+            )
+        ):
+            db.add(
+                MissionAssignment(
+                    mission_id=active.id,
+                    user_id=profile.user_id,
+                    role_on_mission="crew",
+                    seat=f"MS{crew_profiles.index(profile) + 1}",
+                )
+            )
+    for mission in (active, upcoming):
+        if not db.scalar(
+            select(MissionAssignment.id).where(
+                MissionAssignment.mission_id == mission.id,
+                MissionAssignment.user_id == control.id,
+            )
+        ):
+            db.add(
+                MissionAssignment(
+                    mission_id=mission.id,
+                    user_id=control.id,
+                    role_on_mission="flight_director",
+                    seat="FD",
+                )
+            )
+        if medical and not db.scalar(
+            select(MissionAssignment.id).where(
+                MissionAssignment.mission_id == mission.id,
+                MissionAssignment.user_id == medical.id,
+            )
+        ):
+            db.add(
+                MissionAssignment(
+                    mission_id=mission.id,
+                    user_id=medical.id,
+                    role_on_mission="flight_surgeon",
+                    seat="MED",
+                )
+            )
+    if not db.scalar(select(TelemetryScenario.id).where(TelemetryScenario.mission_id == active.id)):
+        db.add(
+            TelemetryScenario(
+                mission_id=active.id,
+                name=demo_marker,
+                seed=2026,
+                config={
+                    "scenario_id": "mc-synthetic-demo-2026",
+                    "stress": 0.3,
+                    "sleep_penalty": 0.35,
+                    "solar_event_day": 40,
+                    "solar_event_dose_msv": 18.0,
+                    "solar_event_label": f"{demo_marker} — modelled solar event",
+                },
+                is_active=True,
+            )
+        )
+    db.commit()
+
+    telemetry_exists = db.scalar(
+        select(TelemetrySnapshot.id)
+        .where(
+            TelemetrySnapshot.mission_id == active.id,
+            TelemetrySnapshot.scenario_id == "mc-synthetic-demo-2026",
+        )
+        .limit(1)
+    )
+    if not telemetry_exists:
+        from . import simulation
+
+        scenario = db.scalar(
+            select(TelemetryScenario)
+            .where(TelemetryScenario.mission_id == active.id)
+            .order_by(TelemetryScenario.created_at.desc())
+        )
+        simulation.regenerate_mission(
+            db, active, seed=2026, config=scenario.config, now=now - timedelta(days=1)
+        )
+
+    generated_samples = db.scalars(
+        select(TelemetrySnapshot).where(
+            TelemetrySnapshot.mission_id == active.id,
+            TelemetrySnapshot.scenario_id == "mc-synthetic-demo-2026",
+        )
+    ).all()
+    now_naive = now.replace(tzinfo=None)
+    for snapshot in generated_samples:
+        recorded_at = snapshot.recorded_at
+        comparison_time = recorded_at.replace(tzinfo=None) if recorded_at.tzinfo else recorded_at
+        if comparison_time > now_naive:
+            snapshot.recorded_at = recorded_at - timedelta(days=1)
+    db.commit()
+
+    medical_id = medical.id if medical else control.id
+    for index, (profile, spec) in enumerate(zip(crew_profiles, crew_specs)):
+        if not db.scalar(
+            select(TelemetrySnapshot.id).where(
+                TelemetrySnapshot.mission_id == active.id,
+                TelemetrySnapshot.astronaut_id == profile.id,
+                TelemetrySnapshot.scenario_id == "mc-synthetic-demo-2026-current",
+            )
+        ):
+            db.add(
+                TelemetrySnapshot(
+                    astronaut_id=profile.id,
+                    mission_id=active.id,
+                    recorded_at=now,
+                    heart_rate=spec["heart_rate"],
+                    hrv=48.0 - index * 2.2,
+                    systolic=112.0 + index * 3.0,
+                    diastolic=72.0 + index * 1.5,
+                    spo2=spec["spo2"],
+                    resp_rate=14.0 + index * 0.7,
+                    body_temp=spec["body_temp"],
+                    steps=7200 - index * 550,
+                    sleep_hours=spec["sleep_hours"],
+                    sleep_quality=max(3.0, 8.3 - index * 0.9),
+                    exercise_minutes=42.0 - index * 4.0,
+                    recovery_score=max(28.0, 88.0 - index * 12.0),
+                    source="simulated",
+                    scenario_id="mc-synthetic-demo-2026-current",
+                    sensor_status="nominal" if spec["severity"] in ("low", "moderate") else "review",
+                )
+            )
+        observation_ref = f"{demo_marker}: simulated mission-load stress indicator"
+        if not db.scalar(
+            select(HealthObservation.id).where(
+                HealthObservation.astronaut_id == profile.id,
+                HealthObservation.mission_id == active.id,
+                HealthObservation.source_ref == observation_ref,
+            )
+        ):
+            db.add(
+                HealthObservation(
+                    astronaut_id=profile.id,
+                    mission_id=active.id,
+                    metric="simulated_stress_indicator",
+                    value=spec["stress"],
+                    unit="0–10",
+                    method="derived_model",
+                    source_ref=observation_ref,
+                    recorded_at=now,
+                )
+            )
+        insight_title = f"{demo_marker} — {profile.callsign} monitoring scenario"
+        if not db.scalar(
+            select(AIInsight.id).where(
+                AIInsight.astronaut_id == profile.id,
+                AIInsight.mission_id == active.id,
+                AIInsight.title == insight_title,
+            )
+        ):
+            db.add(
+                AIInsight(
+                    astronaut_id=profile.id,
+                    mission_id=active.id,
+                    kind="rule",
+                    domain="demonstration",
+                    severity=spec["severity"],
+                    title=insight_title,
+                    summary=(
+                        f"Synthetic scenario only. Simulated heart rate {spec['heart_rate']:.0f} bpm, "
+                        f"SpO2 {spec['spo2']:.1f}%, and sleep {spec['sleep_hours']:.1f} hours. "
+                        "Review the trend; this is not a diagnosis."
+                    ),
+                    explanation={"data_class": "synthetic_demonstration"},
+                    confidence=1.0,
+                    data_class="synthetic_demo",
+                    status="open",
+                )
+            )
+    db.commit()
+
+    incident_specs = [
+        {
+            "title": f"{demo_marker} — elevated simulated physiological indicators",
+            "astronaut": crew_profiles[4],
+            "severity": "critical",
+            "status": "new",
+            "description": (
+                "Demonstration scenario: simulated heart rate and oxygen saturation have shifted from "
+                "this fictional crew member's synthetic baseline. Recommended response: prompt medical "
+                "review and repeat the simulated check. Not a real medical alert."
+            ),
+        },
+        {
+            "title": f"{demo_marker} — modelled radiation exposure review",
+            "astronaut": crew_profiles[2],
+            "severity": "high",
+            "status": "acknowledged",
+            "description": (
+                "Demonstration scenario: modelled mission dose includes a configured event increment; "
+                "this is not a dosimeter measurement. Recommended response: review the scenario profile "
+                "with mission operations."
+            ),
+        },
+    ]
+    for spec in incident_specs:
+        incident = db.scalar(
+            select(Incident).where(
+                Incident.mission_id == active.id,
+                Incident.source == "synthetic_demo",
+                Incident.title == spec["title"],
+            )
+        )
+        if not incident:
+            incident = Incident(
+                mission_id=active.id,
+                astronaut_id=spec["astronaut"].id,
+                source="synthetic_demo",
+                severity=spec["severity"],
+                title=spec["title"],
+                description=spec["description"],
+                status=spec["status"],
+                assigned_to=medical_id,
+                acknowledged_at=now - timedelta(minutes=12) if spec["status"] == "acknowledged" else None,
+                created_at=now - timedelta(minutes=24),
+            )
+            db.add(incident)
+            db.flush()
+            db.add(
+                IncidentEvent(
+                    incident_id=incident.id,
+                    actor_id=control.id,
+                    action="created",
+                    note=demo_marker,
+                    created_at=now - timedelta(minutes=24),
+                )
+            )
+            db.add(
+                IncidentEvent(
+                    incident_id=incident.id,
+                    actor_id=control.id,
+                    action="assigned",
+                    note=f"{demo_marker} — assigned for review.",
+                    created_at=now - timedelta(minutes=23),
+                )
+            )
+            if spec["status"] == "acknowledged":
+                db.add(
+                    IncidentEvent(
+                        incident_id=incident.id,
+                        actor_id=medical_id,
+                        action="acknowledged",
+                        note=f"{demo_marker} — review queued.",
+                        created_at=now - timedelta(minutes=12),
+                    )
+                )
+        elif incident.assigned_to is None:
+            incident.assigned_to = medical_id
+            db.add(
+                IncidentEvent(
+                    incident_id=incident.id,
+                    actor_id=control.id,
+                    action="assigned",
+                    note=f"{demo_marker} — assigned for review.",
+                    created_at=now,
+                )
+            )
+    db.commit()
+    return {
+        "created": created,
+        "active_mission_id": active.id,
+        "upcoming_mission_id": upcoming.id,
+        "crew_profiles": len(crew_profiles),
+    }
 
 
 def seed_if_empty() -> None:

@@ -327,7 +327,18 @@ export function ResearchAnalysisView({ dataset, response }: { dataset: Dataset; 
       keyIndicators.push({ label: 'Status', value: 'No structured analysis available' });
     }
 
-    return { indicators, analysisObj, analysisText, summary, seriesInfo, interpretation, limitations, dataClass, keyIndicators };
+    return {
+      indicators,
+      analysisObj,
+      analysisText,
+      summary,
+      summaryRawRows,
+      seriesInfo,
+      interpretation,
+      limitations,
+      dataClass,
+      keyIndicators,
+    };
   }, [dataset, payload, endpointLimitations]);
 
   const chartTitle = useMemo(() => {
@@ -439,8 +450,6 @@ export function ResearchAnalysisView({ dataset, response }: { dataset: Dataset; 
     model.analysisText ||
     (model.analysisObj && Object.keys(model.analysisObj).length > 0)
   );
-  const hasRawRows = !!(model.summaryRawRows && model.summaryRawRows.length);
-
   if (!payload || (isPlainObject(payload) && Object.keys(payload).length === 0) || (!hasRenderable && !model.analysisText)) {
     return (
       <div className="border-t border-border/10 pt-4 space-y-3">
@@ -529,37 +538,41 @@ export function ResearchAnalysisView({ dataset, response }: { dataset: Dataset; 
         {model.seriesInfo ? (
           renderChart()
         ) : model.summary ? (
-          model.summaryRawRows ? (
           <div className="space-y-2">
-              <p className="text-sm text-muted-silver">Aggregate summary statistics and raw imported rows (no time-series chart; each row is one sample/animal).</p>
-              <div className="overflow-auto rounded-md border border-border/10">
-                <table className="min-w-full text-xs text-left">
-                  <thead className="bg-charcoal/40 text-muted-silver">
-                    <tr>
-                      <th className="px-3 py-2">Group</th>
-                      <th className="px-3 py-2">n</th>
-                      <th className="px-3 py-2">Mean</th>
-                      <th className="px-3 py-2">Median</th>
-                      <th className="px-3 py-2">SD</th>
-                      <th className="px-3 py-2">Min</th>
-                      <th className="px-3 py-2">Max</th>
+            <p className="text-sm text-muted-silver">
+              {model.summaryRawRows
+                ? 'Aggregate summary statistics and raw imported rows (no time-series chart; each row is one sample/animal).'
+                : 'Aggregate summary statistics (no time-series chart available in this dataset).'}
+            </p>
+            <div className="overflow-auto rounded-md border border-border/10">
+              <table className="min-w-full text-xs text-left">
+                <thead className="bg-charcoal/40 text-muted-silver">
+                  <tr>
+                    <th className="px-3 py-2">Group</th>
+                    <th className="px-3 py-2">n</th>
+                    <th className="px-3 py-2">Mean</th>
+                    <th className="px-3 py-2">Median</th>
+                    <th className="px-3 py-2">SD</th>
+                    <th className="px-3 py-2">Min</th>
+                    <th className="px-3 py-2">Max</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(model.summary).map(([group, stats]: any) => (
+                    <tr key={group} className="border-t border-border/10 text-warm-ivory/90">
+                      <td className="px-3 py-2 font-medium">{group}</td>
+                      <td className="px-3 py-2">{stats?.n ?? '—'}</td>
+                      <td className="px-3 py-2">{stats?.mean ?? '—'}</td>
+                      <td className="px-3 py-2">{stats?.median ?? '—'}</td>
+                      <td className="px-3 py-2">{stats?.sd ?? '—'}</td>
+                      <td className="px-3 py-2">{stats?.min ?? '—'}</td>
+                      <td className="px-3 py-2">{stats?.max ?? '—'}</td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {Object.entries(model.summary).map(([group, stats]: any) => (
-                      <tr key={group} className="border-t border-border/10 text-warm-ivory/90">
-                        <td className="px-3 py-2 font-medium">{group}</td>
-                        <td className="px-3 py-2">{stats?.n ?? '—'}</td>
-                        <td className="px-3 py-2">{stats?.mean ?? '—'}</td>
-                        <td className="px-3 py-2">{stats?.median ?? '—'}</td>
-                        <td className="px-3 py-2">{stats?.sd ?? '—'}</td>
-                        <td className="px-3 py-2">{stats?.min ?? '—'}</td>
-                        <td className="px-3 py-2">{stats?.max ?? '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {model.summaryRawRows && (
               <details className="mt-2 text-xs text-muted-silver">
                 <summary className="cursor-pointer text-warm-ivory underline">Show raw imported rows (derived fields)</summary>
                 <div className="mt-2 overflow-auto rounded-md border border-border/10">
@@ -585,15 +598,14 @@ export function ResearchAnalysisView({ dataset, response }: { dataset: Dataset; 
                   </table>
                 </div>
               </details>
-            </div>
-          ) : (
-            <div className="space-y-2">
-            )
-        ) : (
-          <div className="space-y-2">
-            <p className="text-sm text-muted-silver">Aggregate summary statistics (no time-series chart available in this dataset).</p>
-            <div className="rounded-md border border-border/10 bg-charcoal/20 p-3 text-sm text-muted-silver whitespace-pre-wrap">{model.analysisText}</div>
+            )}
           </div>
+        ) : model.analysisText ? (
+          <div className="space-y-2">
+            <p className="text-sm text-muted-silver">Plain-text analysis (no time-series chart available in this dataset).</p>
+            <div className="rounded-md border border-border/10 bg-charcoal/20 p-3 text-sm text-muted-silver whitespace-pre-wrap">
+              {model.analysisText}
+            </div>
           </div>
         ) : (
           <div className="rounded-md border border-border/10 bg-charcoal/20 p-4 text-sm text-muted-silver">

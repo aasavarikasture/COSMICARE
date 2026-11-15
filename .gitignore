@@ -1,0 +1,63 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/.venv/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env
+frontend/.env.local
+frontend/.env.*
+!frontend/.env.example
+
+# Databases / local runtime data
+*.db
+*.sqlite
+*.sqlite3
+backend/*.db
+cosmicare_rebuild.db
+test_*.db
+
+# Build / artifacts
+frontend/dist/
+frontend/build/
+coverage/
+*.log
+logs/
+tmp/
+temp/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Misc
+*.pid
+*.bak
+
+# Temporary development repair scripts
+frontend/encode.py
+frontend/fix_medical.py
+frontend/gen.py
+frontend/rewrite_medical.py
+
+# NASA dataset: pending redistribution-license verification
+backend/data/nasa/*.csv
